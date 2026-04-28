@@ -4,14 +4,18 @@
 # Guided Dock Setup
 #
 # Presents a swiftDialog checkbox list of installed apps and adds selected
-# apps to the current user's Dock using dockutil.
+# apps to the current user's Dock using dockutil. Apps already in the Dock are
+# shown as checked. A follow-up dialog lists non-business Dock items to remove,
+# all checked by default; only items left checked are removed if the user confirms.
 #
 # Usage:
 #   Run via a Jamf Pro policy. Parameters 4-11: list of apps (each param = one app).
 #   Each value can be:
+#     - DisplayName,Path (preferred): Safari,/Applications/Safari.app
 #     - Path to app: /Applications/Google Chrome.app
-#     - App name: Safari, Slack, "Google Chrome"
-#   If no parameters are provided, uses a default list of common apps.
+#     - App name: Slack, "Google Chrome"
+#   Only apps that exist on disk are included. DisplayName,Path entries must match that shape
+#   (path ends in .app). If no parameters are provided, only the built-in default list is used.
 #
 #   Test mode: Pass --test or -t as first argument to run without making changes.
 #   Example: ./script.sh --test
@@ -24,7 +28,7 @@
 
 set -e
 
-script_version="2026.4.1"
+script_version="2026.4.2"
 
 ## Test mode: when set, no Dock changes are made
 ## Enable via: --test or -t as first arg, or DOCK_SETUP_TEST=1 environment variable
@@ -48,8 +52,12 @@ userHome="/Users/${currentuser}"
 TEMP_JSON="/var/tmp/dock_setup_dialog.json"
 TEMP_RESULT="/var/tmp/dock_setup_result.json"
 
-## Default list of apps to offer for Dock (DisplayName,Path)
-## Only apps that are installed will be shown to the user
+# Appended to checkbox labels when an item is already in the Dock (must match jq in build_checkbox_json)
+CHECKBOX_ALREADY_IN_DOCK_SUFFIX=" (Already in Dock)"
+
+# Default list of apps to offer for Dock (DisplayName,Path)
+# Only apps that are installed will be shown to the user
+# The expected format is: DisplayName,Path
 DEFAULT_APPS=(
     "Google Chrome,/Applications/Google Chrome.app"
     "Microsoft Edge,/Applications/Microsoft Edge.app"
@@ -63,7 +71,7 @@ DEFAULT_APPS=(
     "Microsoft Word,/Applications/Microsoft Word.app"
     "Microsoft Excel,/Applications/Microsoft Excel.app"
     "Microsoft PowerPoint,/Applications/Microsoft PowerPoint.app"
-    "OneNote,/Applications/Microsoft OneNote.app"
+    "Microsoft OneNote,/Applications/Microsoft OneNote.app"
     "Zoom,/Applications/Zoom.us.app"
     "Terminal,/System/Applications/Utilities/Terminal.app"
     "Calendar,/System/Applications/Calendar.app"
@@ -86,6 +94,7 @@ DEFAULT_APPS=(
 # Non-removable apps
 # These apps will not be removed from the Dock
 # Finder, System Settings, Self Service, Self Service+
+# The expected format is: DisplayName,Path
 NON_REMOVABLE_APPS=(
     "Finder,/System/Library/CoreServices/Finder.app"
     "System Settings,/System/Applications/System Settings.app"
@@ -98,8 +107,8 @@ NON_REMOVABLE_APPS=(
 # These are apps that are not typically used by business users
 # These include apps like Music, Photos, TV, etc.
 # The user can choose to keep these apps in the Dock if they want to.
+# The expected format is: DisplayName,Path
 NON_BUSINESS_APPS=(
-    "TV,/System/Applications/TV.app"
     "Music,/System/Applications/Music.app"
     "Photos,/System/Applications/Photos.app"
     "Phone,/System/Applications/Phone.app"
@@ -196,39 +205,84 @@ resolve_app_identifier() {
     fi
 }
 
-# Load app list from Parameters 4-11 or use defaults (populates LOAD_APP_LIST_RESULT)
+# True if value looks like DisplayName,Path (path ends with .app, both sides non-empty after trim)
+valid_display_comma_path_format() {
+    local entry="$1"
+    local display_name app_path
+    [[ -z "$entry" || "$entry" != *","* ]] && return 1
+    display_name=$(echo "${entry%%,*}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    app_path=$(echo "${entry#*,}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$display_name" || -z "$app_path" ]] && return 1
+    [[ "$app_path" == */*.app ]] || return 1
+    return 0
+}
+
+# True if needle equals any of the following arguments
+path_in_array() {
+    local needle="$1"
+    shift
+    local p
+    for p in "$@"; do
+        [[ "$p" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# Load app list from Parameters 4-11 plus DEFAULT_APPS (populates LOAD_APP_LIST_RESULT).
+# Only entries in the expected DisplayName,Path format (or legacy path / app name resolved
+# via resolve_app_identifier) that point to an installed bundle are included. Order: policy
+# parameters first, then defaults; duplicate paths are skipped.
+
 load_app_list() {
     local params=("${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" "${10:-}" "${11:-}")
-    local param_items=()
-    local entry path seen_paths
-
-    for p in "${params[@]}"; do
-        [[ -z "$p" ]] && continue
-        # Support comma-separated values in a single param (e.g. "Chrome,Safari" or "/Applications/Chrome.app,/Applications/Safari.app")
-        IFS=',' read -ra items <<< "$p"
-        for item in "${items[@]}"; do
-            item=$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            [[ -z "$item" ]] && continue
-            [[ "$item" == "--test" || "$item" == "-t" ]] && continue
-            local resolved
-            resolved=$(resolve_app_identifier "$item")
-            [[ -n "$resolved" ]] && param_items+=("$resolved")
-        done
-    done
+    local param display_name app_path exp_path resolved
+    local seen_paths=()
 
     LOAD_APP_LIST_RESULT=()
-    if [[ ${#param_items[@]} -gt 0 ]]; then
-        seen_paths=""
-        for entry in "${param_items[@]}"; do
-            path="${entry#*,}"
-            if ! echo "$seen_paths" | grep -qFx "$path" 2>/dev/null; then
-                seen_paths="${seen_paths:+$seen_paths$'\n'}$path"
-                LOAD_APP_LIST_RESULT+=("$entry")
-            fi
-        done
-    else
-        LOAD_APP_LIST_RESULT=("${DEFAULT_APPS[@]}")
+
+    if [[ ${#params[@]} -eq 0 ]]; then
+        log "INFO" "No additional apps provided. Using default apps."
     fi
+
+    for param in "${params[@]}"; do
+        param=$(echo "$param" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [[ -z "$param" ]] && continue
+
+        if valid_display_comma_path_format "$param"; then
+            display_name=$(echo "${param%%,*}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            app_path=$(echo "${param#*,}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            exp_path="$app_path"
+            [[ "$exp_path" == ~* ]] && exp_path="${userHome}${exp_path#\~}"
+            if app_is_installed "$exp_path" && ! path_in_array "$exp_path" "${seen_paths[@]}"; then
+                seen_paths+=("$exp_path")
+                LOAD_APP_LIST_RESULT+=("${display_name},${exp_path}")
+            fi
+        else
+            resolved=$(resolve_app_identifier "$param")
+            if [[ -n "$resolved" ]]; then
+                exp_path="${resolved#*,}"
+                if ! path_in_array "$exp_path" "${seen_paths[@]}"; then
+                    seen_paths+=("$exp_path")
+                    LOAD_APP_LIST_RESULT+=("$resolved")
+                fi
+            fi
+        fi
+    done
+
+    for param in "${DEFAULT_APPS[@]}"; do
+        if ! valid_display_comma_path_format "$param"; then
+            log "WARN" "Skipping malformed default Dock list entry (expected DisplayName,Path): $param"
+            continue
+        fi
+        app_path=$(echo "${param#*,}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        exp_path="$app_path"
+        [[ "$exp_path" == ~* ]] && exp_path="${userHome}${exp_path#\~}"
+        if app_is_installed "$exp_path" && ! path_in_array "$exp_path" "${seen_paths[@]}"; then
+            display_name=$(echo "${param%%,*}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            seen_paths+=("$exp_path")
+            LOAD_APP_LIST_RESULT+=("${display_name},${exp_path}")
+        fi
+    done
 }
 
 # Filter to only installed apps, return "DisplayName|Path" for each (populates GET_INSTALLED_APPS_RESULT)
@@ -292,12 +346,30 @@ ensure_jq() {
     fi
 }
 
-# Build checkbox JSON for swiftDialog (each item is "DisplayName|AppPath")
-# Entries are sorted alphabetically by display name
+# Build checkbox JSON for swiftDialog. First argument: 1 = when checked is true,
+# append CHECKBOX_ALREADY_IN_DOCK_SUFFIX to the label (main Dock dialog); 0 = no suffix.
+# Remaining args: lines DisplayName|AppPath|checked — checked is literal "true" or "false".
+# If the third field is omitted, the box defaults to unchecked.
+# Entries are sorted alphabetically by display name.
 build_checkbox_json() {
-    printf '%s\n' "$@" | jq -R -s '
+    local append_in_dock_suffix="${1:-0}"
+    shift
+    printf '%s\n' "$@" | jq -R -s \
+        --arg append "$append_in_dock_suffix" \
+        --arg sfx "$CHECKBOX_ALREADY_IN_DOCK_SUFFIX" '
         split("\n") | map(select(length > 0)) |
-        map(split("|") | {"label": .[0], "checked": true, "icon": .[1]}) |
+        map(split("|") |
+            if length >= 3 then
+                (.[2] == "true") as $chk |
+                {
+                    "label": (if ($chk and ($append == "1")) then (.[0] + $sfx) else .[0] end),
+                    "subtitle": (if ($chk and ($append == "1")) then (.[0] + $sfx) else .[0] end),
+                    "checked": $chk,
+                    "icon": .[1]
+                }
+            else
+                {"label": .[0], "checked": false, "icon": .[1]}
+            end) |
         sort_by(.label | ascii_downcase) |
         {"checkbox": .}
     '
@@ -311,10 +383,11 @@ show_dialog() {
     dialog_json=$(jq -n \
         --argjson checkboxes "$checkbox_json" \
         '{
-            "title": "Set Up Your Dock",
-            "message": "Select the apps you would like to add to your Dock.\n\nOnly installed apps are shown.\n\nYour screen will flicker briefly as the Dock is updated. \n\nThe applications will not be deleted from your Mac.",
+            "title": "Dock Setup",
+            "message": "Select the apps you would like to add to your Dock.\n\nNotes:\n- Only installed apps are shown.\n- Your screen will flicker briefly as the Dock is updated. \n- The applications will not be deleted from your Mac. \n- Unchecked apps will be removed from the Dock.",
+            "messagefont": "weight=medium,size=14",
             "icon": "SF=dock.rectangle,colour1=#007AFF",
-            "height": "450",
+            "height": "600",
             "button1text": "Add to Dock",
             "button2text": "Cancel",
             "checkboxstyle": {"style": "switch", "size": "small"}
@@ -324,33 +397,17 @@ show_dialog() {
     "$DIALOG_APP" -o -p --jsonfile "$TEMP_JSON" --json 2>/dev/null || true
 }
 
-# Show second dialog: prompt to remove non-business apps from Dock
-show_remove_nonbusiness_dialog() {
-    local message="Would you like to remove non-business apps (e.g. Music, Photos, FaceTime, iMovie, etc.) from your Dock?\n\nThis will not remove essential apps like Finder or Self Service."
-    local dialog_json
-
-    dialog_json=$(jq -n \
-        --arg msg "$message" \
-        '{
-            "title": "Remove Non-Business Apps",
-            "message": $msg,
-            "icon": "SF=trash,colour1=#FF3B30",
-            "height": "250",
-            "button1text": "Yes, Remove Them",
-            "button2text": "No, Keep Them"
-        }')
-
-    echo "$dialog_json" > "$TEMP_JSON"
-    "$DIALOG_APP" -o -p --jsonfile "$TEMP_JSON" 2>/dev/null || true
-}
-
-# Remove non-business apps from Dock (skips NON_REMOVABLE_APPS)
-remove_nonbusiness_apps_from_dock() {
-    local entry display_name app_path app_basename
-    local removed=0
-
-    # Build set of non-removable app names for exclusion
+# Populate NONBUSINESS_IN_DOCK_ITEMS with "DisplayName|Path" for installed
+# non-business apps that appear in dock_list and are not in NON_REMOVABLE_APPS.
+# Duplicate bundle names (e.g. repeated array entries) are only listed once.
+collect_nonbusiness_in_dock_items() {
+    local dock_list="$1"
+    local entry display_name app_path app_basename skip nr
     local non_removable_names=()
+    local listed_basenames=()
+
+    NONBUSINESS_IN_DOCK_ITEMS=()
+
     for entry in "${NON_REMOVABLE_APPS[@]}"; do
         non_removable_names+=("$(basename "${entry#*,}" .app)")
     done
@@ -362,15 +419,67 @@ remove_nonbusiness_apps_from_dock() {
 
         app_basename=$(basename "$app_path" .app)
 
-        # Skip if in non-removable list
-        local skip=0
+        path_in_array "$app_basename" "${listed_basenames[@]}" && continue
+        listed_basenames+=("$app_basename")
+
+        skip=0
         for nr in "${non_removable_names[@]}"; do
             [[ "$app_basename" == "$nr" ]] && { skip=1; break; }
         done
         [[ $skip -eq 1 ]] && continue
 
-        # Remove from Dock if present
-        if "$DOCKUTIL" --list "$userHome" 2>/dev/null | grep -qF "$app_basename"; then
+        if echo "$dock_list" | grep -qF "$app_basename"; then
+            NONBUSINESS_IN_DOCK_ITEMS+=("$display_name|$app_path")
+        fi
+    done
+}
+
+# Show second dialog: same message and buttons; lists removable non-business
+# Dock apps as checkboxes (caller supplies checkbox JSON). JSON result on stdout.
+show_remove_nonbusiness_dialog() {
+    local checkbox_json="$1"
+    local message="Would you like to remove non-business apps (e.g. Music, Photos, FaceTime, iMovie, etc.) from your Dock?\n\nThis will not remove essential apps like Finder or Self Service.\n\nOnly apps currently in the Dock are listed."
+    local dialog_json
+
+    dialog_json=$(jq -n \
+        --arg msg "$message" \
+        --argjson checkboxes "$checkbox_json" \
+        '{
+            "title": "Remove Non-Business Apps",
+            "message": $msg,
+            "messagefont": "weight=medium,size=14",
+            "icon": "SF=trash,colour1=#FF3B30",
+            "height": "450",
+            "button1text": "Yes, Remove Them",
+            "button2text": "No, Keep Them",
+            "checkboxstyle": {"style": "switch", "size": "small"}
+        } + $checkboxes')
+
+    echo "$dialog_json" > "$TEMP_JSON"
+    "$DIALOG_APP" -o -p --jsonfile "$TEMP_JSON" --json 2>/dev/null
+}
+
+# Remove non-business apps from Dock for checkbox items still selected as true
+# in result_json (first arg). Remaining args are "DisplayName|Path" shown in the dialog.
+remove_nonbusiness_apps_from_dock() {
+    local result_json="$1"
+    shift
+    local item display_name app_path selected app_basename
+    local removed=0
+    local dock_list
+
+    dock_list=$("$DOCKUTIL" --list "$userHome" 2>/dev/null || true)
+
+    for item in "$@"; do
+        display_name="${item%|*}"
+        app_path="${item#*|}"
+
+        selected=$(echo "$result_json" | jq -r --arg name "$display_name" '.[$name] // empty')
+        [[ "$selected" != "true" ]] && continue
+
+        app_basename=$(basename "$app_path" .app)
+
+        if echo "$dock_list" | grep -qF "$app_basename"; then
             if [[ "$TEST_MODE" == "1" ]]; then
                 log "TEST" "Would remove $display_name from Dock"
             else
@@ -470,16 +579,27 @@ add_apps_to_dock() {
 }
 
 cleanup() {
-    rm -f "$TEMP_JSON" "$TEMP_RESULT" 2>/dev/null || true
+    log "INFO" "Running cleanup"
+    log "INFO" "Removing temp files"
+    if [[ -f "$TEMP_JSON" ]]; then
+        rm -f "$TEMP_JSON" 2>/dev/null || true
+        log "INFO" "Temp file $TEMP_JSON removed"
+    fi
+    if [[ -f "$TEMP_RESULT" ]]; then
+        rm -f "$TEMP_RESULT" 2>/dev/null || true
+        log "INFO" "Temp file $TEMP_RESULT removed"
+    fi
+    log "INFO" "Cleanup complete"
+    exit 0
 }
 
 ################################################################################
 # Main
 ################################################################################
 
-log "INFO" "Starting Guided Dock setup"
+log "INFO" "Starting Dock setup"
 log "INFO" "Script version: $script_version"
-log "INFO" "Test mode: ${TEST_MODE:-"False"}"
+log "INFO" "Test mode: $TEST_MODE"
 log "INFO" "Current user: $currentuser"
 log "INFO" "User home: $userHome"
 log "INFO" "Current user ID: $(id -u $currentuser)"
@@ -519,8 +639,24 @@ if [[ ${#installed_apps[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Build checkbox JSON and show dialog
-checkbox_json=$(build_checkbox_json "${installed_apps[@]}")
+# Build checkbox JSON (pre-check apps already in the Dock; labels match swiftDialog JSON keys)
+dockutil_list_cache=$("$DOCKUTIL" --list "$userHome" 2>/dev/null || true)
+main_checkbox_input=()
+installed_apps_labeled=()
+for item in "${installed_apps[@]}"; do
+    display_name="${item%|*}"
+    app_path="${item#*|}"
+    app_basename=$(basename "$app_path" .app)
+    if echo "$dockutil_list_cache" | grep -qF "$app_basename"; then
+        main_checkbox_input+=("${item}|true")
+        installed_apps_labeled+=("${display_name}${CHECKBOX_ALREADY_IN_DOCK_SUFFIX}|${app_path}")
+    else
+        main_checkbox_input+=("${item}|false")
+        installed_apps_labeled+=("$item")
+    fi
+done
+installed_apps=("${installed_apps_labeled[@]}")
+checkbox_json=$(build_checkbox_json 1 "${main_checkbox_input[@]}")
 result=$(show_dialog "$checkbox_json")
 
 # User canceled or closed without selecting
@@ -535,15 +671,30 @@ add_apps_to_dock "$result" "${installed_apps[@]}"
 # Remove unchecked apps from Dock
 remove_unselected_apps_from_dock "$result" "${installed_apps[@]}"
 
-# Second dialog: offer to remove non-business apps from Dock
-show_remove_nonbusiness_dialog
-remove_dialog_exit=$?
-if [[ $remove_dialog_exit -eq 0 ]]; then
-    log "INFO" "User chose to remove non-business apps from Dock"
-    remove_nonbusiness_apps_from_dock
+# Second dialog: offer to remove non-business apps from Dock (list pre-checked)
+dockutil_list_nb=$("$DOCKUTIL" --list "$userHome" 2>/dev/null || true)
+collect_nonbusiness_in_dock_items "$dockutil_list_nb"
+
+if [[ ${#NONBUSINESS_IN_DOCK_ITEMS[@]} -eq 0 ]]; then
+    log "INFO" "No removable non-business apps in the Dock; skipping removal prompt."
 else
-    log "INFO" "User chose to keep non-business apps in Dock"
+    nb_checkbox_input=()
+    for item in "${NONBUSINESS_IN_DOCK_ITEMS[@]}"; do
+        nb_checkbox_input+=("${item}|true")
+    done
+    nb_checkbox_json=$(build_checkbox_json 0 "${nb_checkbox_input[@]}")
+    set +e
+    remove_nb_result=$(show_remove_nonbusiness_dialog "$nb_checkbox_json")
+    remove_dialog_exit=$?
+    set -e
+    if [[ $remove_dialog_exit -eq 0 ]]; then
+        log "INFO" "User confirmed non-business Dock cleanup (removing apps still checked)"
+        remove_nonbusiness_apps_from_dock "$remove_nb_result" "${NONBUSINESS_IN_DOCK_ITEMS[@]}"
+    else
+        log "INFO" "User chose to keep non-business apps in Dock"
+    fi
 fi
 
 log "INFO" "Dock setup complete."
+
 exit 0
